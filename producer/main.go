@@ -8,163 +8,164 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
-	pb "github.com/yourusername/p3/proto"
+	pb "producer/proto"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+var (
+	threads    = flag.Int("threads", 2, "Number of producer threads")
+	serverAddr = flag.String("server", "localhost:9090", "Consumer server address")
+	folders    = flag.String("folders", "", "Comma-separated list of folders")
+)
+
 const chunkSize = 64 * 1024 // 64KB chunks
 
-type Producer struct {
-	id         int
-	serverAddr string
-	videoDir   string
-}
+func main() {
+	flag.Parse()
 
-func NewProducer(id int, serverAddr string) *Producer {
-	return &Producer{
-		id:         id,
-		serverAddr: serverAddr,
-		videoDir:   fmt.Sprintf("../videos/producer%d", id),
+	if *folders == "" {
+		log.Fatal("Please specify folders with -folders flag")
 	}
-}
 
-func (p *Producer) uploadVideo(filename string) error {
-	// Read the video file
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		return fmt.Errorf("failed to read file: %v", err)
+	// Parse folder list
+	folderList := parseFolders(*folders)
+	if len(folderList) < *threads {
+		log.Printf("Warning: %d threads but only %d folders\n", *threads, len(folderList))
+		*threads = len(folderList)
 	}
 
 	// Connect to consumer
-	conn, err := grpc.Dial(p.serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(*serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		return fmt.Errorf("failed to connect: %v", err)
+		log.Fatalf("Failed to connect: %v", err)
 	}
 	defer conn.Close()
 
-	client := pb.NewMediaUploadClient(conn)
-	stream, err := client.UploadVideo(context.Background())
-	if err != nil {
-		return fmt.Errorf("failed to create stream: %v", err)
+	client := pb.NewVideoUploadServiceClient(conn)
+
+	// Start producer threads
+	var wg sync.WaitGroup
+	for i := 0; i < *threads; i++ {
+		wg.Add(1)
+		go producerWorker(i, folderList[i], client, &wg)
 	}
 
-	// Send video in chunks
-	basename := filepath.Base(filename)
-	totalSize := int64(len(data))
-	chunkCount := (len(data) + chunkSize - 1) / chunkSize
-
-	log.Printf("Producer %d: Uploading %s (%d bytes, %d chunks)", p.id, basename, totalSize, chunkCount)
-
-	for i := 0; i < chunkCount; i++ {
-		start := i * chunkSize
-		end := start + chunkSize
-		if end > len(data) {
-			end = len(data)
-		}
-
-		chunk := &pb.VideoChunk{
-			Filename:    basename,
-			Data:        data[start:end],
-			ChunkNumber: int64(i),
-			IsLast:      i == chunkCount-1,
-		}
-
-		if i == 0 {
-			chunk.TotalSize = totalSize
-		}
-
-		if err := stream.Send(chunk); err != nil {
-			return fmt.Errorf("failed to send chunk %d: %v", i, err)
-		}
-
-		// Wait for ACK
-		resp, err := stream.Recv()
-		if err != nil {
-			return fmt.Errorf("failed to receive ACK for chunk %d: %v", i, err)
-		}
-
-		if resp.Status == pb.UploadResponse_QUEUE_FULL {
-			log.Printf("Producer %d: Queue full! Video %s was dropped", p.id, basename)
-			return fmt.Errorf("queue full")
-		}
-
-		if resp.Status == pb.UploadResponse_ERROR {
-			log.Printf("Producer %d: Error uploading %s: %s", p.id, basename, resp.Message)
-			return fmt.Errorf("upload error: %s", resp.Message)
-		}
-
-		// Progress indicator
-		if i%10 == 0 || i == chunkCount-1 {
-			progress := float64(i+1) / float64(chunkCount) * 100
-			log.Printf("Producer %d: Progress %s: %.1f%%", p.id, basename, progress)
-		}
-	}
-
-	// Close and get final response
-	if err := stream.CloseSend(); err != nil {
-		return fmt.Errorf("failed to close stream: %v", err)
-	}
-
-	log.Printf("Producer %d: Successfully uploaded %s", p.id, basename)
-	return nil
+	wg.Wait()
+	log.Println("All producers finished")
 }
 
-func (p *Producer) run() {
-	log.Printf("Producer %d starting, reading from %s", p.id, p.videoDir)
-
-	// Check if directory exists
-	if _, err := os.Stat(p.videoDir); os.IsNotExist(err) {
-		log.Fatalf("Producer %d: Directory %s does not exist", p.id, p.videoDir)
+func parseFolders(folderStr string) []string {
+	var folders []string
+	current := ""
+	for _, ch := range folderStr {
+		if ch == ',' {
+			if current != "" {
+				folders = append(folders, current)
+				current = ""
+			}
+		} else {
+			current += string(ch)
+		}
 	}
+	if current != "" {
+		folders = append(folders, current)
+	}
+	return folders
+}
 
-	// Find all video files
-	files, err := filepath.Glob(filepath.Join(p.videoDir, "*"))
+func producerWorker(id int, folder string, client pb.VideoUploadServiceClient, wg *sync.WaitGroup) {
+	defer wg.Done()
+	log.Printf("Producer %d scanning folder: %s\n", id, folder)
+
+	files, err := os.ReadDir(folder)
 	if err != nil {
-		log.Fatalf("Producer %d: Failed to list files: %v", p.id, err)
-	}
-
-	if len(files) == 0 {
-		log.Printf("Producer %d: No video files found in %s", p.id, p.videoDir)
+		log.Printf("Producer %d error reading folder: %v\n", id, err)
 		return
 	}
 
-	log.Printf("Producer %d: Found %d files to upload", p.id, len(files))
-
-	// Upload each video
 	for _, file := range files {
-		info, err := os.Stat(file)
-		if err != nil || info.IsDir() {
+		if file.IsDir() {
 			continue
 		}
 
-		// Only process video files
-		ext := filepath.Ext(file)
+		// Check if it's a video file
+		ext := filepath.Ext(file.Name())
 		if ext != ".mp4" && ext != ".avi" && ext != ".mov" && ext != ".mkv" {
-			log.Printf("Producer %d: Skipping non-video file %s", p.id, file)
 			continue
 		}
 
-		log.Printf("Producer %d: Starting upload of %s", p.id, filepath.Base(file))
-		
-		if err := p.uploadVideo(file); err != nil {
-			log.Printf("Producer %d: Failed to upload %s: %v", p.id, filepath.Base(file), err)
+		videoPath := filepath.Join(folder, file.Name())
+		log.Printf("Producer %d uploading: %s\n", id, file.Name())
+
+		err := uploadVideo(client, videoPath, file.Name())
+		if err != nil {
+			log.Printf("Producer %d error uploading %s: %v\n", id, file.Name(), err)
+		} else {
+			log.Printf("Producer %d completed: %s\n", id, file.Name())
 		}
 
-		// Small delay between uploads
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond) // Small delay between uploads
 	}
-
-	log.Printf("Producer %d: Finished uploading all videos", p.id)
 }
 
-func main() {
-	id := flag.Int("id", 1, "Producer ID")
-	server := flag.String("server", "localhost:50051", "Consumer server address")
-	flag.Parse()
+func uploadVideo(client pb.VideoUploadServiceClient, filePath, filename string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 
-	producer := NewProducer(*id, *server)
-	producer.run()
+	stream, err := client.UploadVideo(ctx)
+	if err != nil {
+		return err
+	}
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	buffer := make([]byte, chunkSize)
+	for {
+		n, err := file.Read(buffer)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+
+		chunk := &pb.VideoChunk{
+			Filename: filename,
+			Data:     buffer[:n],
+			IsLast:   false,
+		}
+
+		if err := stream.Send(chunk); err != nil {
+			return err
+		}
+	}
+
+	// Send final chunk
+	finalChunk := &pb.VideoChunk{
+		Filename: filename,
+		Data:     []byte{},
+		IsLast:   true,
+	}
+	stream.Send(finalChunk)
+
+	// Close and receive response
+	resp, err := stream.CloseAndRecv()
+	if err != nil {
+		return err
+	}
+
+	if !resp.Success {
+		return fmt.Errorf("upload failed: %s", resp.Message)
+	}
+
+	return nil
 }

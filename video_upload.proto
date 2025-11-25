@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package videoupload;
+
+option go_package = "./proto";
+
+service VideoUploadService {
+  rpc UploadVideo(stream VideoChunk) returns (UploadResponse);
+}
+
+message VideoChunk {
+  string filename = 1;
+  bytes data = 2;
+  bool is_last = 3;
+}
+
+message UploadResponse {
+  bool success = 1;
+  string message = 2;
+}

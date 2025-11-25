@@ -1,10 +1,6 @@
 package main
 
 import (
-	"context"
-	"crypto/md5"
-	"encoding/hex"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -15,58 +11,100 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
-	"time"
 
-	pb "github.com/yourusername/p3/proto"
+	pb "consumer/proto"
+
 	"google.golang.org/grpc"
 )
 
 type VideoJob struct {
 	Filename string
 	Data     []byte
-	Hash     string
 }
 
-type VideoMetadata struct {
-	Filename    string    `json:"filename"`
-	FullPath    string    `json:"full_path"`
-	PreviewPath string    `json:"preview_path"`
-	UploadTime  time.Time `json:"upload_time"`
-	Size        int64     `json:"size"`
+type Server struct {
+	pb.UnimplementedVideoUploadServiceServer
+	queue      chan VideoJob
+	uploadDir  string
+	previewDir string
 }
 
-type Consumer struct {
-	pb.UnimplementedMediaUploadServer
-	queue          chan VideoJob
-	videos         []VideoMetadata
-	videosMutex    sync.RWMutex
-	uploadDir      string
-	previewDir     string
-	duplicates     map[string]bool
-	duplicatesMutex sync.RWMutex
-}
+var (
+	threads   = flag.Int("threads", 3, "Number of consumer threads")
+	queueSize = flag.Int("queue", 10, "Maximum queue size")
+	grpcPort  = flag.Int("grpc-port", 9090, "gRPC port")
+	httpPort  = flag.Int("http-port", 8080, "HTTP port")
+)
 
-func NewConsumer(queueSize int, consumerCount int, uploadDir, previewDir string) *Consumer {
-	c := &Consumer{
-		queue:      make(chan VideoJob, queueSize),
-		videos:     make([]VideoMetadata, 0),
-		uploadDir:  uploadDir,
-		previewDir: previewDir,
-		duplicates: make(map[string]bool),
-	}
+func main() {
+	flag.Parse()
+
+	// Create directories
+	uploadDir := "uploads"
+	previewDir := "previews"
+	os.MkdirAll(uploadDir, 0755)
+	os.MkdirAll(previewDir, 0755)
+
+	// Create bounded queue
+	queue := make(chan VideoJob, *queueSize)
 
 	// Start consumer workers
-	for i := 0; i < consumerCount; i++ {
-		go c.worker(i)
+	var wg sync.WaitGroup
+	for i := 0; i < *threads; i++ {
+		wg.Add(1)
+		go consumerWorker(i, queue, uploadDir, previewDir, &wg)
 	}
 
-	return c
+	// Start gRPC server
+	server := &Server{
+		queue:      queue,
+		uploadDir:  uploadDir,
+		previewDir: previewDir,
+	}
+
+	go startGRPCServer(server)
+
+	// Start HTTP server for GUI
+	startHTTPServer(uploadDir, previewDir)
+
+	wg.Wait()
 }
 
-// gRPC UploadVideo handler
-func (c *Consumer) UploadVideo(stream pb.MediaUpload_UploadVideoServer) error {
+func consumerWorker(id int, queue chan VideoJob, uploadDir, previewDir string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	log.Printf("Consumer worker %d started\n", id)
+
+	for job := range queue {
+		log.Printf("Worker %d processing: %s\n", id, job.Filename)
+
+		// Save video file
+		videoPath := filepath.Join(uploadDir, job.Filename)
+		err := os.WriteFile(videoPath, job.Data, 0644)
+		if err != nil {
+			log.Printf("Worker %d error saving file: %v\n", id, err)
+			continue
+		}
+
+		// Generate 10-second preview
+		previewPath := filepath.Join(previewDir, "preview_"+job.Filename)
+		err = generatePreview(videoPath, previewPath)
+		if err != nil {
+			log.Printf("Worker %d error generating preview: %v\n", id, err)
+			continue
+		}
+
+		log.Printf("Worker %d completed: %s\n", id, job.Filename)
+	}
+}
+
+func generatePreview(inputPath, outputPath string) error {
+	cmd := exec.Command("ffmpeg", "-i", inputPath, "-t", "10", "-c", "copy", "-y", outputPath)
+	return cmd.Run()
+}
+
+func (s *Server) UploadVideo(stream pb.VideoUploadService_UploadVideoServer) error {
 	var filename string
-	var buffer []byte
+	var videoData []byte
 
 	for {
 		chunk, err := stream.Recv()
@@ -77,177 +115,82 @@ func (c *Consumer) UploadVideo(stream pb.MediaUpload_UploadVideoServer) error {
 			return err
 		}
 
-		if chunk.ChunkNumber == 0 {
+		if filename == "" {
 			filename = chunk.Filename
-			buffer = make([]byte, 0, chunk.TotalSize)
 		}
 
-		buffer = append(buffer, chunk.Data...)
-
-		// Send ACK
-		if err := stream.Send(&pb.UploadResponse{
-			Status:      pb.UploadResponse_ACK,
-			ChunkNumber: chunk.ChunkNumber,
-		}); err != nil {
-			return err
-		}
-
-		if chunk.IsLast {
-			// Calculate hash for duplicate detection
-			hash := hashData(buffer)
-
-			// Check for duplicates
-			c.duplicatesMutex.RLock()
-			isDuplicate := c.duplicates[hash]
-			c.duplicatesMutex.RUnlock()
-
-			if isDuplicate {
-				log.Printf("Duplicate video detected: %s", filename)
-				return stream.Send(&pb.UploadResponse{
-					Status:  pb.UploadResponse_ERROR,
-					Message: "Duplicate video",
-				})
-			}
-
-			// Try to add to queue (non-blocking)
-			job := VideoJob{
-				Filename: filename,
-				Data:     buffer,
-				Hash:     hash,
-			}
-
-			select {
-			case c.queue <- job:
-				log.Printf("Video queued: %s (size: %d bytes)", filename, len(buffer))
-				return stream.Send(&pb.UploadResponse{
-					Status:  pb.UploadResponse_SUCCESS,
-					Message: "Video uploaded successfully",
-				})
-			default:
-				log.Printf("Queue full! Dropping video: %s", filename)
-				return stream.Send(&pb.UploadResponse{
-					Status:  pb.UploadResponse_QUEUE_FULL,
-					Message: "Queue is full, video dropped",
-				})
-			}
-		}
+		videoData = append(videoData, chunk.Data...)
 	}
 
-	return nil
-}
+	// Try to add to queue (non-blocking)
+	job := VideoJob{
+		Filename: filename,
+		Data:     videoData,
+	}
 
-// Worker processes videos from the queue
-func (c *Consumer) worker(id int) {
-	log.Printf("Consumer worker %d started", id)
-
-	for job := range c.queue {
-		log.Printf("Worker %d processing: %s", id, job.Filename)
-
-		// Save full video
-		timestamp := time.Now().Format("20060102_150405")
-		filename := fmt.Sprintf("%s_%s", timestamp, job.Filename)
-		fullPath := filepath.Join(c.uploadDir, filename)
-
-		if err := os.WriteFile(fullPath, job.Data, 0644); err != nil {
-			log.Printf("Worker %d error saving video: %v", id, err)
-			continue
-		}
-
-		// Generate preview (first 10 seconds)
-		previewFilename := fmt.Sprintf("preview_%s", filename)
-		previewPath := filepath.Join(c.previewDir, previewFilename)
-
-		if err := generatePreview(fullPath, previewPath); err != nil {
-			log.Printf("Worker %d error generating preview: %v", id, err)
-			// Continue even if preview fails
-		}
-
-		// Mark as not duplicate
-		c.duplicatesMutex.Lock()
-		c.duplicates[job.Hash] = true
-		c.duplicatesMutex.Unlock()
-
-		// Add to video list
-		metadata := VideoMetadata{
-			Filename:    job.Filename,
-			FullPath:    "/videos/" + filename,
-			PreviewPath: "/previews/" + previewFilename,
-			UploadTime:  time.Now(),
-			Size:        int64(len(job.Data)),
-		}
-
-		c.videosMutex.Lock()
-		c.videos = append(c.videos, metadata)
-		c.videosMutex.Unlock()
-
-		log.Printf("Worker %d completed: %s", id, job.Filename)
+	select {
+	case s.queue <- job:
+		log.Printf("Video queued: %s (size: %d bytes)\n", filename, len(videoData))
+		return stream.SendAndClose(&pb.UploadResponse{
+			Success: true,
+			Message: "Video uploaded successfully",
+		})
+	default:
+		log.Printf("Queue full! Dropped: %s\n", filename)
+		return stream.SendAndClose(&pb.UploadResponse{
+			Success: false,
+			Message: "Queue is full, video dropped",
+		})
 	}
 }
 
-func hashData(data []byte) string {
-	hash := md5.Sum(data)
-	return hex.EncodeToString(hash[:])
+func startGRPCServer(server *Server) {
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", *grpcPort))
+	if err != nil {
+		log.Fatalf("Failed to listen: %v", err)
+	}
+
+	grpcServer := grpc.NewServer()
+	pb.RegisterVideoUploadServiceServer(grpcServer, server)
+
+	log.Printf("gRPC server listening on port %d\n", *grpcPort)
+	if err := grpcServer.Serve(lis); err != nil {
+		log.Fatalf("Failed to serve: %v", err)
+	}
 }
 
-func generatePreview(inputPath, outputPath string) error {
-	cmd := exec.Command("ffmpeg",
-		"-i", inputPath,
-		"-t", "10",
-		"-c", "copy",
-		"-y",
-		outputPath,
-	)
-	return cmd.Run()
-}
+func startHTTPServer(uploadDir, previewDir string) {
+	// Serve static files
+	fs := http.FileServer(http.Dir("web"))
+	http.Handle("/", fs)
 
-// HTTP handlers
-func (c *Consumer) handleVideos(w http.ResponseWriter, r *http.Request) {
-	c.videosMutex.RLock()
-	defer c.videosMutex.RUnlock()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(c.videos)
-}
-
-func main() {
-	consumerCount := flag.Int("c", 3, "Number of consumer workers")
-	queueSize := flag.Int("q", 10, "Queue size")
-	grpcPort := flag.String("grpc-port", "50051", "gRPC port")
-	httpPort := flag.String("http-port", "8080", "HTTP port")
-	flag.Parse()
-
-	// Create directories
-	uploadDir := "uploads/full"
-	previewDir := "uploads/previews"
-	os.MkdirAll(uploadDir, 0755)
-	os.MkdirAll(previewDir, 0755)
-
-	// Create consumer
-	consumer := NewConsumer(*queueSize, *consumerCount, uploadDir, previewDir)
-
-	// Start gRPC server
-	go func() {
-		lis, err := net.Listen("tcp", ":"+*grpcPort)
+	// API endpoint to list videos
+	http.HandleFunc("/api/videos", func(w http.ResponseWriter, r *http.Request) {
+		files, err := os.ReadDir(uploadDir)
 		if err != nil {
-			log.Fatalf("Failed to listen: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 
-		grpcServer := grpc.NewServer()
-		pb.RegisterMediaUploadServer(grpcServer, consumer)
-
-		log.Printf("gRPC server listening on port %s", *grpcPort)
-		if err := grpcServer.Serve(lis); err != nil {
-			log.Fatalf("Failed to serve: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("["))
+		first := true
+		for _, file := range files {
+			if !file.IsDir() {
+				if !first {
+					w.Write([]byte(","))
+				}
+				w.Write([]byte(fmt.Sprintf(`"%s"`, file.Name())))
+				first = false
+			}
 		}
-	}()
+		w.Write([]byte("]"))
+	})
 
-	// Start HTTP server for GUI
-	http.HandleFunc("/api/videos", consumer.handleVideos)
-	http.Handle("/videos/", http.StripPrefix("/videos/", http.FileServer(http.Dir(uploadDir))))
-	http.Handle("/previews/", http.StripPrefix("/previews/", http.FileServer(http.Dir(previewDir))))
-	http.Handle("/", http.FileServer(http.Dir("static")))
+	// Serve video files
+	http.Handle("/video/", http.StripPrefix("/video/", http.FileServer(http.Dir(uploadDir))))
+	http.Handle("/preview/", http.StripPrefix("/preview/", http.FileServer(http.Dir(previewDir))))
 
-	log.Printf("HTTP server listening on port %s", *httpPort)
-	log.Printf("Consumer started with %d workers and queue size %d", *consumerCount, *queueSize)
-	log.Fatal(http.ListenAndServe(":"+*httpPort, nil))
+	log.Printf("HTTP server listening on port %d\n", *httpPort)
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *httpPort), nil))
 }
