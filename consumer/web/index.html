@@ -3,262 +3,51 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Video Upload Consumer</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+    <title>Consumer Platform</title>
 
-        body {
-            font-family: Arial, sans-serif;
-            background: #1a1a1a;
-            color: #fff;
-            padding: 20px;
-        }
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300..700&display=swap" rel="stylesheet">
 
-        h1 {
-            text-align: center;
-            margin-bottom: 30px;
-            color: #4CAF50;
-        }
-
-        .controls {
-            text-align: center;
-            margin-bottom: 20px;
-        }
-
-        button {
-            background: #4CAF50;
-            color: white;
-            border: none;
-            padding: 10px 20px;
-            cursor: pointer;
-            border-radius: 4px;
-            font-size: 16px;
-        }
-
-        button:hover {
-            background: #45a049;
-        }
-
-        .video-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-            gap: 20px;
-            max-width: 1400px;
-            margin: 0 auto;
-        }
-
-        .video-item {
-            background: #2a2a2a;
-            border-radius: 8px;
-            padding: 15px;
-            cursor: pointer;
-            transition: transform 0.2s;
-            position: relative;
-        }
-
-        .video-item:hover {
-            transform: scale(1.05);
-            background: #333;
-        }
-
-        .video-name {
-            font-size: 14px;
-            margin-bottom: 10px;
-            word-break: break-all;
-        }
-
-        .preview-container {
-            width: 100%;
-            height: 200px;
-            background: #000;
-            border-radius: 4px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-
-        .preview-container video {
-            width: 100%;
-            height: 100%;
-            border-radius: 4px;
-        }
-
-        .preview-placeholder {
-            color: #666;
-            font-size: 14px;
-        }
-
-        #videoModal {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.9);
-            z-index: 1000;
-            align-items: center;
-            justify-content: center;
-        }
-
-        #videoModal.active {
-            display: flex;
-        }
-
-        .modal-content {
-            max-width: 90%;
-            max-height: 90%;
-            position: relative;
-        }
-
-        .modal-content video {
-            width: 100%;
-            height: auto;
-            max-height: 80vh;
-        }
-
-        .close-modal {
-            position: absolute;
-            top: -40px;
-            right: 0;
-            background: #f44336;
-            color: white;
-            border: none;
-            padding: 10px 20px;
-            cursor: pointer;
-            border-radius: 4px;
-        }
-
-        .status {
-            text-align: center;
-            margin-bottom: 20px;
-            color: #888;
-        }
-    </style>
+    <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-    <h1>📹 Video Upload Consumer</h1>
-    
-    <div class="controls">
-        <button onclick="loadVideos()">🔄 Refresh Videos</button>
-    </div>
+    <section class="container">
 
-    <div class="status" id="status">Loading videos...</div>
+        <!-- Header -->
+        <div class="header">
+            <div class="sections">
+                <h2 class="logo">P3</h2>
+                <h2 class="title">Consumer Platform</h2>
+            </div>
 
-    <div class="video-grid" id="videoGrid"></div>
-
-    <div id="videoModal">
-        <div class="modal-content">
-            <button class="close-modal" onclick="closeModal()">✕ Close</button>
-            <video id="modalVideo" controls></video>
+            <div class="sections">
+            <div class="status" id="status">
+                <h4>Loading videos...</h4>
+            </div>
+            <div class="controls">
+                <button onclick="loadVideos()">
+                    Refresh
+                </button>
+            </div>
+            </div>
         </div>
-    </div>
 
-    <script>
-        let videos = [];
+        <!-- Video Grid -->
+        <div class="video-grid" id="video-grid">
+        </div>
 
-        async function loadVideos() {
-            try {
-                document.getElementById('status').textContent = 'Loading videos...';
-                const response = await fetch('/api/videos');
-                videos = await response.json();
-                
-                if (videos.length === 0) {
-                    document.getElementById('status').textContent = 'No videos uploaded yet';
-                } else {
-                    document.getElementById('status').textContent = `${videos.length} video(s) available`;
-                }
-                
-                renderVideos();
-            } catch (error) {
-                console.error('Error loading videos:', error);
-                document.getElementById('status').textContent = 'Error loading videos';
-            }
-        }
+        <!-- Video Modal -->
+        <div id="video-modal">
+        <div class="modal-content">
+            <video id="modal-video" controls></video>
+            <button class="close-modal" onclick="closeModal()">
+                Close video
+            </button>
+        </div>
+        </div>
 
-        function renderVideos() {
-            const grid = document.getElementById('videoGrid');
-            grid.innerHTML = '';
-
-            videos.forEach(video => {
-                const item = document.createElement('div');
-                item.className = 'video-item';
-                
-                const name = document.createElement('div');
-                name.className = 'video-name';
-                name.textContent = video;
-
-                const previewContainer = document.createElement('div');
-                previewContainer.className = 'preview-container';
-                
-                const placeholder = document.createElement('div');
-                placeholder.className = 'preview-placeholder';
-                placeholder.textContent = 'Hover to preview';
-                previewContainer.appendChild(placeholder);
-
-                item.appendChild(name);
-                item.appendChild(previewContainer);
-
-                // Hover preview
-                item.addEventListener('mouseenter', () => {
-                    previewContainer.innerHTML = '';
-                    const previewVideo = document.createElement('video');
-                    previewVideo.src = `/preview/preview_${video}`;
-                    previewVideo.autoplay = true;
-                    previewVideo.muted = true;
-                    previewVideo.loop = true;
-                    previewContainer.appendChild(previewVideo);
-                });
-
-                item.addEventListener('mouseleave', () => {
-                    previewContainer.innerHTML = '';
-                    const placeholder = document.createElement('div');
-                    placeholder.className = 'preview-placeholder';
-                    placeholder.textContent = 'Hover to preview';
-                    previewContainer.appendChild(placeholder);
-                });
-
-                // Click to play full video
-                item.addEventListener('click', () => {
-                    openModal(video);
-                });
-
-                grid.appendChild(item);
-            });
-        }
-
-        function openModal(videoName) {
-            const modal = document.getElementById('videoModal');
-            const video = document.getElementById('modalVideo');
-            video.src = `/video/${videoName}`;
-            modal.classList.add('active');
-            video.play();
-        }
-
-        function closeModal() {
-            const modal = document.getElementById('videoModal');
-            const video = document.getElementById('modalVideo');
-            video.pause();
-            video.src = '';
-            modal.classList.remove('active');
-        }
-
-        // Close modal on background click
-        document.getElementById('videoModal').addEventListener('click', (e) => {
-            if (e.target.id === 'videoModal') {
-                closeModal();
-            }
-        });
-
-        // Load videos on page load
-        loadVideos();
-
-        // Auto-refresh every 5 seconds
-        setInterval(loadVideos, 5000);
-    </script>
+    </section>
+    <script src="scripts.js"></script>
 </body>
 </html>
