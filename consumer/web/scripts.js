@@ -2,17 +2,20 @@ let videos = [];
 
 async function loadVideos() {
     try {
-        document.getElementById('status').textContent = 'Loading videos...';
         const response = await fetch('/api/videos');
-        videos = await response.json();
+        const newVideos = await response.json();
         
-        if (videos.length === 0) {
+        if (newVideos.length === 0) {
             document.getElementById('status').textContent = 'No videos uploaded yet';
         } else {
-            document.getElementById('status').textContent = `${videos.length} video(s) available`;
+            document.getElementById('status').textContent = `${newVideos.length} video(s) available`;
         }
         
-        renderVideos();
+        const hasChanged = JSON.stringify(videos) !== JSON.stringify(newVideos);
+        if (hasChanged) {
+            videos = newVideos;
+            renderVideos();
+        }
     } catch (error) {
         console.error('Error loading videos:', error);
         document.getElementById('status').textContent = 'Error loading videos';
@@ -33,32 +36,36 @@ function renderVideos() {
 
         const previewContainer = document.createElement('div');
         previewContainer.className = 'preview-container';
-        
         const placeholder = document.createElement('div');
         placeholder.className = 'preview-placeholder';
         placeholder.textContent = 'Hover to preview';
+        
+        const previewVideo = document.createElement('video');
+        previewVideo.src = `/preview/preview_${video}`;
+        previewVideo.muted = true;
+        previewVideo.loop = true;
+        previewVideo.playsInline = true;
+        previewVideo.preload = 'metadata';
+        previewVideo.style.display = 'none';
+        
         previewContainer.appendChild(placeholder);
+        previewContainer.appendChild(previewVideo);
 
         item.appendChild(previewContainer);
         item.appendChild(name);
-
-        // Hover preview
         item.addEventListener('mouseenter', () => {
-            previewContainer.innerHTML = '';
-            const previewVideo = document.createElement('video');
-            previewVideo.src = `/preview/preview_${video}`;
-            previewVideo.autoplay = true;
-            previewVideo.muted = true;
-            previewVideo.loop = true;
-            previewContainer.appendChild(previewVideo);
+            placeholder.style.display = 'none';
+            previewVideo.style.display = 'block';
+            previewVideo.currentTime = 0;
+            previewVideo.play().catch(err => {
+                console.log('Preview play failed:', err);
+            });
         });
 
         item.addEventListener('mouseleave', () => {
-            previewContainer.innerHTML = '';
-            const placeholder = document.createElement('div');
-            placeholder.className = 'preview-placeholder';
-            placeholder.textContent = 'Hover to preview';
-            previewContainer.appendChild(placeholder);
+            previewVideo.pause();
+            previewVideo.style.display = 'none';
+            placeholder.style.display = 'block';
         });
 
         item.addEventListener('click', () => {

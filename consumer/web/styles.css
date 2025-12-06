@@ -141,6 +141,7 @@ body {
     height: 100%;
 
     border-radius: 0.5rem;
+    object-fit: contain;
 }
 
 .preview-placeholder {
